@@ -83,8 +83,12 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
    - 因此 `/a/b` 胜过 `/a/{x}` 胜过 `/a/*`；`/items/{id:\d+}` 胜过 `/items/{id}`。
    - `/a/{x}` 与 `/{y}/b` 同时匹配 `/a/b` 时，第一段不同：静态在前的 `/a/{x}` 胜出
      （「靠前的段优先」，规则稳定且可解释）。
-   - 一条模式是另一条的前缀、且另一条多出的段全部是可选段时，**更短的精确模式优先**：
-     `/users` 胜过 `/users/{id?}` 对 `/users` 的匹配。
+    - 一条模式是另一条的前缀（公共段 rank 全部相同）时，**更短的精确模式优先**，
+      无论另一条多出的段是可选段还是通配段：
+      `/users` 胜过 `/users/{id?}` 对 `/users` 的匹配；
+      `/files` 胜过 `/files/*` 对 `/files` 的匹配。
+      （更短的模式不含通配段才是「精确」；若更短的模式本身含通配段，则第一段
+      不同段规则已在通配段位置分出胜负。）
 3. **头条件数量**：仍然并列时，头条件更多的路由更具体、优先。
 4. **方法特异性**：具体方法（如 `GET`）优先于 `ANY`。
 
@@ -103,9 +107,14 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
   - 方法不重叠（`GET /x` 与 `POST /x`）
   - 模式不可能匹配同一路径（静态前缀互斥、正则与静态值确定不兼容等）
   - 头条件互斥（一个要求 `X-Version=1`，另一个要求 `X-Version=2`）
-  - 显式 `priority` 不同，或路径特异性可分高低
+  - 显式 `priority` 不同，或路径特异性可分高低（含前缀规则：`/files` 与
+    `/files/*` 虽重叠，但更短的精确模式 `/files` 特异性更高，允许共存）
 - 删除不存在的 `id` → 404。
 - 批量更新中任意一条不合法 → **整批拒绝，旧表完整保留**。
+
+注册阶段的重叠判定与查找阶段使用同一套优先级语义：两条规则若能匹配同一请求，
+要么注册时被拒绝（优先级无法分出高低），要么被允许共存且所有公共请求都命中
+优先级获胜方。不存在「注册时放行、查找时按相反次序命中」的组合。
 
 正则段之间的重叠判定采用保守策略：两段正则字符串不同即视为「可能重叠」
 （一般正则的交集不可判定），必要时可用显式 `priority` 消歧。
@@ -169,7 +178,22 @@ mvn test
 
 - `PatternMatchingTest`：静态/参数/正则/通配/可选段、方法与头条件组合
 - `PriorityAndConflictTest`：全部优先级规则、运行期冲突、注册期重复/冲突拒绝、整批原子拒绝
+- `OverlapPriorityTest`：重叠边界组合（精确+通配、精确+可选、正则+参数、参数+通配、
+  尾部斜杠变体）在查找与注册两阶段的行为、删除规则后命中结果不变
 - `HotReloadConcurrencyTest`：并发热更新原子可见性、并发冲突注册裁决、持续写入下读性能
 - `PersistenceRecoveryTest`：重启恢复、拒绝更新不落盘、损坏快照快速失败、回滚、批量持久化
-- `LargeScalePerformanceTest`：10,000 条路由的批量注册、查找正确性与性能、大规模下冲突检测
+- `LargeScalePerformanceTest`：10,000 条路由的批量注册、查找正确性与性能、大规模下冲突检测、
+  重叠组合（精确+通配、正则+参数）在大规模下的优先级与性能
 - `RouterApiIntegrationTest`：REST 端到端（201/400/404/409、三态匹配结果）
+
+手工复现「精确路径胜通配」场景：
+
+```bash
+curl -X POST localhost:8080/router/routes -H 'Content-Type: application/json' -d '{
+  "id": "exact", "method": "GET", "pattern": "/files", "handlerId": "ExactHandler"}'
+curl -X POST localhost:8080/router/routes -H 'Content-Type: application/json' -d '{
+  "id": "wild", "method": "GET", "pattern": "/files/*", "handlerId": "WildHandler"}'
+curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d '{
+  "method": "GET", "path": "/files", "headers": {}}'
+# {"status":"HIT","routeId":"exact","handlerId":"ExactHandler", ...}
+```

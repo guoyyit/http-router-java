@@ -168,4 +168,67 @@ class HotReloadConcurrencyTest {
         assertTrue(reads.get() > 10_000, "expected substantial read volume, got " + reads.get());
         assertEquals(50, svc.size()); // temp routes fully removed
     }
+
+    /**
+     * Overlapping routes (exact + wildcard) are updated concurrently. Readers
+     * must always see a consistent table: /files always hits the exact rule,
+     * and /files/a hits the wildcard only when it is registered. A torn table
+     * would show the wildcard winning /files or the exact rule winning /files/a.
+     */
+    @Test
+    void overlappingRoutesRemainConsistentUnderConcurrentUpdates(@TempDir Path dir) throws Exception {
+        RouterService svc = newService(dir, "snap.json");
+        svc.addRoute(route("exact", "/files"));
+
+        int iterations = 200;
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger anomalies = new AtomicInteger();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        // readers continuously query both paths
+        for (int t = 0; t < 6; t++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while (System.nanoTime() < end) {
+                        MatchResult exact = svc.match("GET", "/files", Map.of());
+                        MatchResult wild = svc.match("GET", "/files/a", Map.of());
+                        // /files must always hit the exact rule (never the wildcard)
+                        if (!(exact instanceof MatchResult.Hit h) || !h.route().id().equals("exact")) {
+                            anomalies.incrementAndGet();
+                        }
+                        // /files/a must hit the wildcard when present, else no match
+                        if (wild instanceof MatchResult.Hit h) {
+                            if (!h.route().id().equals("wild")) {
+                                anomalies.incrementAndGet();
+                            }
+                        } else if (!(wild instanceof MatchResult.NoMatch)) {
+                            anomalies.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable e) {
+                    error.compareAndSet(null, e);
+                }
+            });
+        }
+        // writer alternates: add wildcard, remove wildcard
+        pool.submit(() -> {
+            try {
+                start.await();
+                for (int i = 0; i < iterations; i++) {
+                    svc.update(List.of(route("wild", "/files/*")), List.of());
+                    svc.update(List.of(), List.of("wild"));
+                }
+            } catch (Throwable e) {
+                error.compareAndSet(null, e);
+            }
+        });
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "threads did not finish");
+        assertNull(error.get(), () -> "worker exception: " + error.get());
+        assertEquals(0, anomalies.get(), "readers observed an inconsistent overlapping table");
+    }
 }

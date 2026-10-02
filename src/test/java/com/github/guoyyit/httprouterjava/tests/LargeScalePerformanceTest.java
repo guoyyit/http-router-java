@@ -98,4 +98,79 @@ class LargeScalePerformanceTest {
         svc.addRoute(route("fresh", "GET", "/brand/new/path"));
         assertEquals(10_001, svc.size());
     }
+
+    /**
+     * Large-scale table with overlap combinations (exact+wildcard, regex+param,
+     * param+wildcard) must keep correct priority and fast lookups.
+     */
+    @Test
+    void overlapCombinationsAtScale(@TempDir Path dir) {
+        RouterService svc = new RouterService(new RouteSnapshotStore(dir.resolve("big.json")));
+        svc.recover();
+
+        List<Route> batch = new ArrayList<>();
+        // 100 distinct wildcard tails, each covering a group of exact leaves
+        for (int i = 0; i < 100; i++) {
+            batch.add(route("wild" + i, "GET", "/shops/a" + i + "/items/*"));
+        }
+        svc.update(new ArrayList<>(batch), List.of());
+        batch.clear();
+        // 10,000 exact static leaves, each under one wildcard tail
+        for (int i = 0; i < 10_000; i++) {
+            batch.add(route("exact" + i, "GET", "/shops/a" + (i % 100) + "/items/" + i));
+            if (i % 1000 == 999) {
+                svc.update(new ArrayList<>(batch), List.of());
+                batch.clear();
+            }
+        }
+        // regex + param overlap at scale: /v/{i}/{n:\d+} beats /v/{i}/{x} on numeric values
+        for (int i = 0; i < 500; i++) {
+            batch.add(route("num" + i, "GET", "/v/" + i + "/{n:\\d+}"));
+            batch.add(route("any" + i, "GET", "/v/" + i + "/{x}"));
+        }
+        svc.update(new ArrayList<>(batch), List.of());
+        batch.clear();
+        assertEquals(11_100, svc.size());
+
+        // exact path hits the exact rule, not the wildcard tail
+        for (int k = 0; k < 200; k++) {
+            int i = ThreadLocalRandom.current().nextInt(10_000);
+            MatchResult r = svc.match("GET", "/shops/a" + (i % 100) + "/items/" + i, Map.of());
+            assertTrue(r instanceof MatchResult.Hit, "miss for exact index " + i);
+            assertEquals("exact" + i, ((MatchResult.Hit) r).route().id());
+        }
+        // deeper path hits the wildcard tail
+        for (int k = 0; k < 200; k++) {
+            int i = ThreadLocalRandom.current().nextInt(10_000);
+            MatchResult r = svc.match("GET", "/shops/a" + (i % 100) + "/items/" + i + "/extra", Map.of());
+            assertTrue(r instanceof MatchResult.Hit, "miss for wildcard index " + i);
+            assertEquals("wild" + (i % 100), ((MatchResult.Hit) r).route().id());
+        }
+        // regex beats param on numeric values
+        for (int k = 0; k < 100; k++) {
+            int i = ThreadLocalRandom.current().nextInt(500);
+            MatchResult r = svc.match("GET", "/v/" + i + "/42", Map.of());
+            assertTrue(r instanceof MatchResult.Hit);
+            assertEquals("num" + i, ((MatchResult.Hit) r).route().id());
+        }
+        // param beats nothing on alpha values (regex does not match)
+        for (int k = 0; k < 100; k++) {
+            int i = ThreadLocalRandom.current().nextInt(500);
+            MatchResult r = svc.match("GET", "/v/" + i + "/ab", Map.of());
+            assertTrue(r instanceof MatchResult.Hit);
+            assertEquals("any" + i, ((MatchResult.Hit) r).route().id());
+        }
+
+        // perf: lookups stay trie-bounded despite overlap candidates
+        int samples = 100_000;
+        long start = System.nanoTime();
+        for (int k = 0; k < samples; k++) {
+            int i = k % 10_000;
+            svc.match("GET", "/shops/a" + (i % 100) + "/items/" + i, Map.of());
+        }
+        long elapsed = System.nanoTime() - start;
+        double avgMicros = elapsed / 1_000.0 / samples;
+        System.out.printf("Average lookup over %d overlap routes: %.3f us%n", 11_100, avgMicros);
+        assertTrue(avgMicros < 100, "lookup too slow: " + avgMicros + " us average");
+    }
 }

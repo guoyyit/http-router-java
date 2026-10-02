@@ -127,33 +127,48 @@ public final class RoutePattern {
     /**
      * Total specificity order between two patterns that both matched the same
      * request path. Positive: this is more specific; negative: other is more
-     * specific; zero: equally specific (potential ambiguity).
-     *
-     * Rules: compare segment ranks left to right, first difference decides
-     * (static > regex > param > optional > wildcard). If one pattern is a
-     * proper prefix of the other and all extra segments are optional, the
-     * shorter (exact) pattern wins.
-     */
-    public int compareSpecificity(RoutePattern other) {
-        int common = Math.min(segments.size(), other.segments.size());
-        for (int i = 0; i < common; i++) {
-            int r = Integer.compare(segments.get(i).rank(), other.segments.get(i).rank());
-            if (r != 0) {
-                return r;
-            }
-        }
-        if (segments.size() == other.segments.size()) {
-            return 0;
-        }
-        List<Segment> longer = segments.size() > other.segments.size() ? segments : other.segments;
-        boolean extraAllOptional = longer.subList(common, longer.size()).stream()
-                .allMatch(s -> s instanceof Segment.OptionalSeg);
-        if (extraAllOptional) {
-            // shorter pattern matched exactly -> more specific
+    * specific; zero: equally specific (potential ambiguity).
+    *
+    * Rules: compare segment ranks left to right, first difference decides
+    * (static > regex > param > optional > wildcard). If one pattern is a
+     * proper prefix of the other (all common segments have equal rank), the
+     * shorter exact pattern wins, regardless of whether the longer pattern's
+     * extra segments are optional or wildcard. A pattern with a wildcard is
+     * never "exact", so the prefix rule only applies to the shorter pattern
+     * without a wildcard; if the shorter has a wildcard, the first-different
+     * segment rule already decided at the wildcard position.
+    */
+   public int compareSpecificity(RoutePattern other) {
+       int common = Math.min(segments.size(), other.segments.size());
+       for (int i = 0; i < common; i++) {
+           int r = Integer.compare(segments.get(i).rank(), other.segments.get(i).rank());
+           if (r != 0) {
+               return r;
+           }
+       }
+       if (segments.size() == other.segments.size()) {
+           return 0;
+       }
+        // Prefix case: all common segments have equal rank. The shorter exact
+        // pattern wins, whether the longer's extra segments are optional or
+        // wildcard. The shorter is "exact" only when it has no wildcard (a
+        // wildcard absorbs extra segments, so the request is not exactly the
+        // shorter pattern).
+        boolean shorterIsExact = segments.size() < other.segments.size()
+                ? !hasWildcard(segments)
+                : !hasWildcard(other.segments);
+        if (shorterIsExact) {
             return segments.size() < other.segments.size() ? 1 : -1;
         }
-        // cannot happen for two patterns that matched the same path; keep order deterministic
-        return Integer.compare(segments.size(), other.segments.size());
+        // Shorter has a wildcard: the first-different segment rule already
+        // decided at the wildcard position (the longer has a higher-rank
+        // segment there), so this is unreachable in practice; keep order
+        // deterministic by segment count.
+       return Integer.compare(segments.size(), other.segments.size());
+   }
+
+    private static boolean hasWildcard(List<Segment> segs) {
+        return !segs.isEmpty() && segs.get(segs.size() - 1) instanceof Segment.WildcardSeg;
     }
 
     /**
