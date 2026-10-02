@@ -73,6 +73,8 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
 - `CONFLICT`：多条路由以相同的最高优先级同时命中，返回全部候选 `candidates`。
   正常情况下注册阶段就会拒绝产生该歧义的规则；此状态是安全兜底。
 
+方法或头条件不匹配的请求只会得到 `NO_MATCH`（原因可区分），不会被误判为命中或冲突。
+
 ## 5. 优先级规则
 
 多个路由同时命中一个请求时，按以下顺序逐条比较，先区分出高低者为准：
@@ -83,8 +85,12 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
    - 因此 `/a/b` 胜过 `/a/{x}` 胜过 `/a/*`；`/items/{id:\d+}` 胜过 `/items/{id}`。
    - `/a/{x}` 与 `/{y}/b` 同时匹配 `/a/b` 时，第一段不同：静态在前的 `/a/{x}` 胜出
      （「靠前的段优先」，规则稳定且可解释）。
-   - 一条模式是另一条的前缀、且另一条多出的段全部是可选段时，**更短的精确模式优先**：
-     `/users` 胜过 `/users/{id?}` 对 `/users` 的匹配。
+   - 一条模式是另一条的前缀、且另一条多出的段全部可跳过（可选段或通配段）时，
+     **更短的精确模式优先**：`/users` 胜过 `/users/{id?}` 对 `/users` 的匹配；
+     `/files` 胜过 `/files/*` 对 `/files` 的匹配（通配段匹配零个段时仍让位于精确规则）。
+     该前缀规则与逐段比较永远给出一致结论：只有逐段比较完全并列时才进入前缀判定。
+   - 该次序与路径段数、注册顺序、请求方法、头条件均无关；对同一对规则，
+     任何匹配到的公共请求都命中同一个获胜方。
 3. **头条件数量**：仍然并列时，头条件更多的路由更具体、优先。
 4. **方法特异性**：具体方法（如 `GET`）优先于 `ANY`。
 
@@ -93,6 +99,9 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
 ## 6. 注册校验、冲突检测与原子更新
 
 每次新增 / 删除（支持批量）都会先基于旧表构建并**完整校验**新表，然后再切换：
+注册阶段与查找阶段使用**同一套优先级语义**（第 5 节），因此任意两条请求集合重叠的
+规则只有两种结局：注册时被拒绝（旧表完整保留），或被允许共存且所有公共请求都命中
+优先级获胜方——不存在「注册放行、查找却按相反次序命中」的组合。
 
 - 路由 `id` 重复 → 拒绝（409，Duplicate route id）
 - 方法 + 路径模式 + 头条件完全相同 → 拒绝（409，Duplicate registration）
@@ -103,9 +112,12 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
   - 方法不重叠（`GET /x` 与 `POST /x`）
   - 模式不可能匹配同一路径（静态前缀互斥、正则与静态值确定不兼容等）
   - 头条件互斥（一个要求 `X-Version=1`，另一个要求 `X-Version=2`）
-  - 显式 `priority` 不同，或路径特异性可分高低
+  - 显式 `priority` 不同，或路径特异性可分高低——包括精确规则与覆盖它的
+    通配/可选尾段规则（如 `/files` 与 `/files/*`、`/files` 与 `/files/{id?}`），
+    它们的公共请求恒命中精确规则
 - 删除不存在的 `id` → 404。
 - 批量更新中任意一条不合法 → **整批拒绝，旧表完整保留**。
+- 删除任意一条规则后，其余规则相互间的命中结果不变（优先级是逐对比较的全序）。
 
 正则段之间的重叠判定采用保守策略：两段正则字符串不同即视为「可能重叠」
 （一般正则的交集不可判定），必要时可用显式 `priority` 消歧。
@@ -162,14 +174,32 @@ curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' -d 
 ## 11. 测试
 
 ```bash
-mvn test
+mvn -o clean test
 ```
 
 覆盖：
 
 - `PatternMatchingTest`：静态/参数/正则/通配/可选段、方法与头条件组合
 - `PriorityAndConflictTest`：全部优先级规则、运行期冲突、注册期重复/冲突拒绝、整批原子拒绝
-- `HotReloadConcurrencyTest`：并发热更新原子可见性、并发冲突注册裁决、持续写入下读性能
+- `OverlapPriorityTest`：重叠规则命中次序（精确 vs 通配尾段、精确 vs 可选尾段、正则 vs 参数、
+  参数 vs 通配、尾部斜杠变体），注册与查找两阶段判定一致性，删除规则后命中不变
+- `HotReloadConcurrencyTest`：并发热更新原子可见性、并发冲突注册裁决、持续写入下读性能、
+  重叠规则在热更新与拒绝写入下的命中一致性
 - `PersistenceRecoveryTest`：重启恢复、拒绝更新不落盘、损坏快照快速失败、回滚、批量持久化
-- `LargeScalePerformanceTest`：10,000 条路由的批量注册、查找正确性与性能、大规模下冲突检测
-- `RouterApiIntegrationTest`：REST 端到端（201/400/404/409、三态匹配结果）
+- `LargeScalePerformanceTest`：10,000 条路由的批量注册、查找正确性与性能、大规模下冲突检测、
+  含重叠组合的大规模场景
+- `RouterApiIntegrationTest`：REST 端到端（201/400/404/409、三态匹配结果、
+  精确路径与通配路径重叠用例）
+
+手工复现「精确 vs 通配」场景（验收用）：
+
+```bash
+mvn spring-boot:run
+curl -X POST localhost:8080/router/routes -H 'Content-Type: application/json' \
+  -d '{"id":"wild","method":"GET","pattern":"/files/*","handlerId":"WildcardHandler"}'
+curl -X POST localhost:8080/router/routes -H 'Content-Type: application/json' \
+  -d '{"id":"exact","method":"GET","pattern":"/files","handlerId":"ExactHandler"}'
+curl -X POST localhost:8080/router/match -H 'Content-Type: application/json' \
+  -d '{"method":"GET","path":"/files","headers":{}}'
+# 期望：{"status":"HIT","routeId":"exact","handlerId":"ExactHandler", ...}
+```

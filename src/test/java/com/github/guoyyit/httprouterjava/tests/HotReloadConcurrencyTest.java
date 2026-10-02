@@ -168,4 +168,124 @@ class HotReloadConcurrencyTest {
         assertTrue(reads.get() > 10_000, "expected substantial read volume, got " + reads.get());
         assertEquals(50, svc.size()); // temp routes fully removed
     }
+
+    /**
+     * Overlapping exact + wildcard rules under hot updates: readers of "/files"
+     * must see either the old table (wildcard only) or the new table (exact wins),
+     * never a torn state, a conflict, or a miss.
+     */
+    @Test
+    void overlappingExactAndWildcardStayConsistentDuringUpdates(@TempDir Path dir) throws Exception {
+        RouterService svc = newService(dir, "snap.json");
+        svc.addRoute(route("wild", "/files/*"));
+
+        int iterations = 150;
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger anomalies = new AtomicInteger();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        for (int t = 0; t < 6; t++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                    while (System.nanoTime() < end) {
+                        MatchResult r = svc.match("GET", "/files", Map.of());
+                        if (r instanceof MatchResult.Hit h) {
+                            String id = h.route().id();
+                            // old table: only wild; new table: exact must win over wild
+                            if (!id.equals("wild") && !id.equals("exact")) {
+                                anomalies.incrementAndGet();
+                            }
+                        } else {
+                            anomalies.incrementAndGet();
+                        }
+                        // deeper path is always served by the wildcard rule
+                        MatchResult deep = svc.match("GET", "/files/a/b", Map.of());
+                        if (!(deep instanceof MatchResult.Hit dh) || !dh.route().id().equals("wild")) {
+                            anomalies.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable e) {
+                    error.compareAndSet(null, e);
+                }
+            });
+        }
+        pool.submit(() -> {
+            try {
+                start.await();
+                for (int i = 0; i < iterations; i++) {
+                    svc.addRoute(route("exact", "/files"));
+                    svc.removeRoute("exact");
+                }
+            } catch (Throwable e) {
+                error.compareAndSet(null, e);
+            }
+        });
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "threads did not finish");
+        assertNull(error.get(), () -> "worker exception: " + error.get());
+        assertEquals(0, anomalies.get(), "readers observed a torn/intermediate table");
+
+        // final state: exact registered -> /files deterministically hits exact
+        svc.addRoute(route("exact", "/files"));
+        MatchResult r = svc.match("GET", "/files", Map.of());
+        assertTrue(r instanceof MatchResult.Hit);
+        assertEquals("exact", ((MatchResult.Hit) r).route().id());
+    }
+
+    /** A rejected conflicting update must not disturb in-flight readers or the live table. */
+    @Test
+    void rejectedUpdateLeavesLiveTableServing(@TempDir Path dir) throws Exception {
+        RouterService svc = newService(dir, "snap.json");
+        svc.addRoute(route("exact", "/files"));
+        svc.addRoute(route("wild", "/files/*"));
+
+        ExecutorService pool = Executors.newFixedThreadPool(6);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger anomalies = new AtomicInteger();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        for (int t = 0; t < 4; t++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                    while (System.nanoTime() < end) {
+                        MatchResult r = svc.match("GET", "/files", Map.of());
+                        if (!(r instanceof MatchResult.Hit h) || !h.route().id().equals("exact")) {
+                            anomalies.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable e) {
+                    error.compareAndSet(null, e);
+                }
+            });
+        }
+        for (int t = 0; t < 2; t++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int i = 0; i < 100; i++) {
+                        try {
+                            // ambiguous vs itself-keyed duplicate: always rejected
+                            svc.addRoute(route("wild-dup", "/files/*"));
+                        } catch (RouteConflictException expected) {
+                            // rejected: live table must stay intact
+                        }
+                    }
+                } catch (Throwable e) {
+                    error.compareAndSet(null, e);
+                }
+            });
+        }
+        start.countDown();
+        pool.shutdown();
+        assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "threads did not finish");
+        assertNull(error.get(), () -> "worker exception: " + error.get());
+        assertEquals(0, anomalies.get(), "rejected updates disturbed the live table");
+        assertEquals(2, svc.size());
+    }
 }

@@ -131,8 +131,8 @@ public final class RoutePattern {
      *
      * Rules: compare segment ranks left to right, first difference decides
      * (static > regex > param > optional > wildcard). If one pattern is a
-     * proper prefix of the other and all extra segments are optional, the
-     * shorter (exact) pattern wins.
+     * proper prefix of the other and all extra segments are skippable
+     * (optional or wildcard), the shorter (exact) pattern wins.
      */
     public int compareSpecificity(RoutePattern other) {
         int common = Math.min(segments.size(), other.segments.size());
@@ -146,9 +146,9 @@ public final class RoutePattern {
             return 0;
         }
         List<Segment> longer = segments.size() > other.segments.size() ? segments : other.segments;
-        boolean extraAllOptional = longer.subList(common, longer.size()).stream()
-                .allMatch(s -> s instanceof Segment.OptionalSeg);
-        if (extraAllOptional) {
+        boolean extraAllSkippable = longer.subList(common, longer.size()).stream()
+                .allMatch(s -> s instanceof Segment.OptionalSeg || s instanceof Segment.WildcardSeg);
+        if (extraAllSkippable) {
             // shorter pattern matched exactly -> more specific
             return segments.size() < other.segments.size() ? 1 : -1;
         }

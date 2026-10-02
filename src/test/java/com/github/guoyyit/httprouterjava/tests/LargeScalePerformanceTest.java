@@ -98,4 +98,65 @@ class LargeScalePerformanceTest {
         svc.addRoute(route("fresh", "GET", "/brand/new/path"));
         assertEquals(10_001, svc.size());
     }
+
+    /**
+     * Large table dense with overlapping exact/wildcard/optional/param/regex combos:
+     * every overlapping pair must resolve to the documented winner, at scale.
+     */
+    @Test
+    void overlappingCombosAtScaleResolveByPriority(@TempDir Path dir) {
+        RouterService svc = new RouterService(new RouteSnapshotStore(dir.resolve("ovl.json")));
+        svc.recover();
+
+        int pairs = 2_000;
+        List<Route> batch = new ArrayList<>();
+        for (int i = 0; i < pairs; i++) {
+            // exact static leaf + covering wildcard tail (the reported bug shape)
+            batch.add(route("exact-" + i, "GET", "/files" + i));
+            batch.add(route("wild-" + i, "GET", "/files" + i + "/*"));
+            // exact + optional tail
+            batch.add(route("opt-" + i, "GET", "/opt" + i + "/{id?}"));
+            // regex + param on the same shape
+            batch.add(route("num-" + i, "GET", "/v" + i + "/{n:\\d+}"));
+            batch.add(route("any-" + i, "GET", "/v" + i + "/{x}"));
+            if (batch.size() >= 1000) {
+                svc.update(new ArrayList<>(batch), List.of());
+                batch.clear();
+            }
+        }
+        if (!batch.isEmpty()) {
+            svc.update(new ArrayList<>(batch), List.of());
+        }
+        assertEquals(pairs * 5, svc.size());
+
+        // correctness: every common request hits the documented winner
+        for (int k = 0; k < 500; k++) {
+            int i = ThreadLocalRandom.current().nextInt(pairs);
+            assertEquals("exact-" + i, hitId(svc, "/files" + i));
+            assertEquals("wild-" + i, hitId(svc, "/files" + i + "/a/b"));
+            assertEquals("opt-" + i, hitId(svc, "/opt" + i));
+            assertEquals("opt-" + i, hitId(svc, "/opt" + i + "/7"));
+            assertEquals("num-" + i, hitId(svc, "/v" + i + "/42"));
+            assertEquals("any-" + i, hitId(svc, "/v" + i + "/ab"));
+        }
+
+        // perf: lookups over overlapping combos stay trie-bounded
+        int samples = 50_000;
+        long start = System.nanoTime();
+        for (int k = 0; k < samples; k++) {
+            int i = k % pairs;
+            svc.match("GET", "/files" + i, Map.of());
+            svc.match("GET", "/v" + i + "/42", Map.of());
+        }
+        long elapsed = System.nanoTime() - start;
+        double avgMicros = elapsed / 1_000.0 / (samples * 2.0);
+        System.out.printf("Average overlapping-combo lookup over %d routes: %.3f us%n", pairs * 5, avgMicros);
+        assertTrue(avgMicros < 100, "lookup too slow: " + avgMicros + " us average");
+    }
+
+    private String hitId(RouterService svc, String path) {
+        MatchResult r = svc.match("GET", path, Map.of());
+        assertTrue(r instanceof MatchResult.Hit, "expected HIT for " + path + ", got " + r);
+        return ((MatchResult.Hit) r).route().id();
+    }
 }

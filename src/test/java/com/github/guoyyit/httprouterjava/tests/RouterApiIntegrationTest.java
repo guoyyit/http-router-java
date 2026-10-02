@@ -158,4 +158,52 @@ class RouterApiIntegrationTest {
                 .andExpect(jsonPath("$.status").value("NO_MATCH"))
                 .andExpect(jsonPath("$.reason").value(org.hamcrest.Matchers.containsString("Header")));
     }
+
+    @Test
+    void exactAndWildcardOverlapResolvesToExactThroughHttp() throws Exception {
+        // registration order: wildcard first, exact second - both must be accepted
+        mvc.perform(post("/router/routes").contentType("application/json")
+                .content("""
+                        {"id":"wild","method":"GET","pattern":"/files/*","handlerId":"WildcardHandler"}
+                        """)).andExpect(status().isCreated());
+        mvc.perform(post("/router/routes").contentType("application/json")
+                .content("""
+                        {"id":"exact","method":"GET","pattern":"/files","handlerId":"ExactHandler"}
+                        """)).andExpect(status().isCreated());
+
+        // the exact path hits the exact rule, not the wildcard
+        mvc.perform(post("/router/match").contentType("application/json")
+                        .content("""
+                                {"method":"GET","path":"/files","headers":{}}
+                                """))
+                .andExpect(jsonPath("$.status").value("HIT"))
+                .andExpect(jsonPath("$.routeId").value("exact"))
+                .andExpect(jsonPath("$.handlerId").value("ExactHandler"));
+
+        // trailing slash variant normalizes to the exact path
+        mvc.perform(post("/router/match").contentType("application/json")
+                        .content("""
+                                {"method":"GET","path":"/files/","headers":{}}
+                                """))
+                .andExpect(jsonPath("$.status").value("HIT"))
+                .andExpect(jsonPath("$.handlerId").value("ExactHandler"));
+
+        // deeper paths still hit the wildcard rule
+        mvc.perform(post("/router/match").contentType("application/json")
+                        .content("""
+                                {"method":"GET","path":"/files/a/b","headers":{}}
+                                """))
+                .andExpect(jsonPath("$.status").value("HIT"))
+                .andExpect(jsonPath("$.routeId").value("wild"))
+                .andExpect(jsonPath("$.handlerId").value("WildcardHandler"));
+
+        // deleting the exact rule re-exposes the wildcard for "/files"
+        mvc.perform(delete("/router/routes/exact")).andExpect(status().isNoContent());
+        mvc.perform(post("/router/match").contentType("application/json")
+                        .content("""
+                                {"method":"GET","path":"/files","headers":{}}
+                                """))
+                .andExpect(jsonPath("$.status").value("HIT"))
+                .andExpect(jsonPath("$.handlerId").value("WildcardHandler"));
+    }
 }
